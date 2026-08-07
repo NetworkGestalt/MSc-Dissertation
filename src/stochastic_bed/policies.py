@@ -1,4 +1,4 @@
-"""Policy networks map history to [D, p] designs (D sensors, p coordinates)."""
+"""Policy networks map history to a [D, p] design (D sensors, p coordinates) and its entropy."""
 
 import math
 
@@ -65,7 +65,8 @@ class DeterministicPolicy(nn.Module):
     def forward(self, hist_designs, hist_outcomes):
         enc = self.history_encoder(hist_designs, hist_outcomes)  # [B, enc_output_dim]
         z = self.mlp(enc).unflatten(-1, (self.D, self.p))  # [B, D, p]
-        return torch.tanh(z) * self.design_bound
+        design = torch.tanh(z) * self.design_bound
+        return design, None
 
 
 class StochasticPolicy(nn.Module):
@@ -99,8 +100,7 @@ class StochasticPolicy(nn.Module):
         self.log_std_mlp = MLP(enc_output_dim, D * p, hidden_dims)
         nn.init.constant_(self.log_std_mlp.net[-1].bias, math.log(max(init_std, 1e-8)))
 
-        self.tanh_transform = transforms.TanhTransform(cache_size=1)
-        self.scale_transform = transforms.AffineTransform(loc=0, scale=design_bound)
+        self.tanh_transform = transforms.TanhTransform()
 
     def _base_distribution(self, hist_designs, hist_outcomes):
         enc = self.history_encoder(hist_designs, hist_outcomes)  # [B, enc_output_dim]
@@ -114,31 +114,17 @@ class StochasticPolicy(nn.Module):
             reinterpreted_batch_ndims=2,
         )  # Event shape: [D, p]
 
-    def _distribution(self, hist_designs, hist_outcomes):
-        base_dist = self._base_distribution(hist_designs, hist_outcomes)
-        return dist.TransformedDistribution(
-            base_dist,
-            [self.tanh_transform, self.scale_transform],
-        )
-
-    def entropy(self, hist_designs, hist_outcomes, n_samples=100):
-        base_dist = self._base_distribution(hist_designs, hist_outcomes)
-        base_entropy = base_dist.entropy()  # [B]
+    def _entropy(self, base_dist, n_samples=100):
+        # H(Y) = H(X) + E[log|det J|]: Gaussian entropy exact, tanh log-det by MC
         x = base_dist.rsample((n_samples,))  # [n_samples, B, D, p]
-
-        y_tanh = self.tanh_transform(x)
-        log_det_tanh = self.tanh_transform.log_abs_det_jacobian(x, y_tanh)
-        y_final = self.scale_transform(y_tanh)
-        log_det_scale = self.scale_transform.log_abs_det_jacobian(y_tanh, y_final)
-
-        total_log_det = log_det_tanh + log_det_scale  # [n_samples, B, D, p]
-        total_log_det = total_log_det.sum(dim=[-2, -1])  # [n_samples, B]
-
-        # Total entropy: H(Y) = H(X) + E[log|det J|]
-        return base_entropy + total_log_det.mean(dim=0)
+        log_det_tanh = self.tanh_transform.log_abs_det_jacobian(x, torch.tanh(x))
+        log_det_scale = self.D * self.p * math.log(self.design_bound)
+        return base_dist.entropy() + log_det_tanh.sum(dim=[-2, -1]).mean(dim=0) + log_det_scale
 
     def forward(self, hist_designs, hist_outcomes):
-        return self._distribution(hist_designs, hist_outcomes).rsample()  # [B, D, p]
+        base_dist = self._base_distribution(hist_designs, hist_outcomes)
+        design = torch.tanh(base_dist.rsample()) * self.design_bound  # [B, D, p]
+        return design, self._entropy(base_dist)
 
 
 class RandomPolicy(nn.Module):
@@ -151,9 +137,6 @@ class RandomPolicy(nn.Module):
     def forward(self, hist_designs, hist_outcomes):
         B = hist_designs.shape[0]
         b = self.design_bound
-        return hist_designs.new_empty(B, self.D, self.p).uniform_(-b, b)
-
-    def entropy(self, hist_designs, hist_outcomes):
-        B = hist_designs.shape[0]
-        b = self.design_bound
-        return hist_designs.new_full((B,), self.D * self.p * math.log(2 * b))
+        design = hist_designs.new_empty(B, self.D, self.p).uniform_(-b, b)
+        entropy = hist_designs.new_full((B,), self.D * self.p * math.log(2 * b))
+        return design, entropy

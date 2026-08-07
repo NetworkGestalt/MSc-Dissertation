@@ -11,6 +11,7 @@ from torch import Tensor
 class Trajectory(NamedTuple):
     designs: Tensor  # [B, T, D, p]
     outcomes: Tensor  # [B, T, D]
+    entropies: Tensor | None  # [B, T], or None for policies without entropy
 
 
 class LocationFinding(nn.Module):
@@ -24,7 +25,8 @@ class LocationFinding(nn.Module):
         b: float = 0.1,  # Background signal weight
         m: float = 0.001,  # Min squared distance to a source
         noise_std: float = 0.5,  # Observation noise std
-        prior_bound: float = 3.0,  # Half-width of uniform prior box
+        prior_mean: float | Tensor = 0.0,  # Gaussian prior mean, scalar or [K*p]
+        prior_std: float = 1.0,  # Gaussian prior std (isotropic)
     ) -> None:
         super().__init__()
 
@@ -36,11 +38,14 @@ class LocationFinding(nn.Module):
         self.b = b
         self.m = m
         self.noise_std = noise_std
-        self.prior_bound = prior_bound
+        self.prior_std = prior_std
+
+        mean = torch.as_tensor(prior_mean, dtype=torch.get_default_dtype())
+        self.register_buffer("prior_mean", mean.expand(self.K * self.p).clone())
 
     def prior(self):
-        base = dist.Uniform(-self.prior_bound, self.prior_bound)
-        return dist.Independent(base.expand([self.K * self.p]), 1)  # event shape: [K*p]
+        base = dist.Normal(self.prior_mean, self.prior_std)
+        return dist.Independent(base, 1)  # event shape: [K*p]
 
     def likelihood(self, theta: Tensor, designs: Tensor):
         """Outcome likelihood p(y | theta, design) as a Distribution."""
@@ -62,21 +67,23 @@ class LocationFinding(nn.Module):
     def rollout(self, theta: Tensor, policy: nn.Module) -> Trajectory:
         """Simulate full trajectories under a given batch of thetas and policy."""
         B = theta.shape[0]
-        designs, outcomes = [], []
+        designs, outcomes, entropies = [], [], []
 
         hist_designs = theta.new_zeros(B, 0, self.D, self.p)
         hist_outcomes = theta.new_zeros(B, 0, self.D)
 
         for _ in range(self.T):
-            xi_t = policy(hist_designs, hist_outcomes)
+            xi_t, entropy_t = policy(hist_designs, hist_outcomes)
             y_t = self.step(theta, xi_t)
 
             designs.append(xi_t)
             outcomes.append(y_t)
+            entropies.append(entropy_t)
             hist_designs = torch.cat([hist_designs, xi_t.unsqueeze(1)], dim=1)
             hist_outcomes = torch.cat([hist_outcomes, y_t.unsqueeze(1)], dim=1)
 
         return Trajectory(
             designs=torch.stack(designs, dim=1),
             outcomes=torch.stack(outcomes, dim=1),
+            entropies=torch.stack(entropies, dim=1) if entropies[0] is not None else None,
         )
