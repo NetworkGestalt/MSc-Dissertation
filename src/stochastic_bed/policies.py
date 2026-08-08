@@ -1,11 +1,10 @@
-"""Policy networks map history to a [D, p] design (D sensors, p coordinates) and its entropy."""
+"""Policy networks map history to a [D, p] design (D sensors, p coordinates) and its std."""
 
 import math
 
 import torch
 import torch.nn as nn
 import torch.distributions as dist
-from torch.distributions import transforms
 
 
 class MLP(nn.Module):
@@ -69,7 +68,16 @@ class DeterministicPolicy(nn.Module):
         return design, None
 
 
-class StochasticPolicy(nn.Module):
+class TanhGaussianPolicy(nn.Module):
+    """Base for policies whose design is a tanh-squashed Gaussian; subclasses define _base_distribution."""
+
+    def forward(self, hist_designs, hist_outcomes):
+        base_dist = self._base_distribution(hist_designs, hist_outcomes)
+        design = torch.tanh(base_dist.rsample()) * self.design_bound  # [B, D, p]
+        return design, base_dist.base_dist.stddev  # [B, D, p]
+
+
+class StochasticPolicy(TanhGaussianPolicy):
     def __init__(
         self,
         D: int,
@@ -100,8 +108,6 @@ class StochasticPolicy(nn.Module):
         self.log_std_mlp = MLP(enc_output_dim, D * p, hidden_dims)
         nn.init.constant_(self.log_std_mlp.net[-1].bias, math.log(max(init_std, 1e-8)))
 
-        self.tanh_transform = transforms.TanhTransform()
-
     def _base_distribution(self, hist_designs, hist_outcomes):
         enc = self.history_encoder(hist_designs, hist_outcomes)  # [B, enc_output_dim]
 
@@ -114,17 +120,51 @@ class StochasticPolicy(nn.Module):
             reinterpreted_batch_ndims=2,
         )  # Event shape: [D, p]
 
-    def _entropy(self, base_dist, n_samples=100):
-        # H(Y) = H(X) + E[log|det J|]: Gaussian entropy exact, tanh log-det by MC
-        x = base_dist.rsample((n_samples,))  # [n_samples, B, D, p]
-        log_det_tanh = self.tanh_transform.log_abs_det_jacobian(x, torch.tanh(x))
-        log_det_scale = self.D * self.p * math.log(self.design_bound)
-        return base_dist.entropy() + log_det_tanh.sum(dim=[-2, -1]).mean(dim=0) + log_det_scale
+
+class StaticDeterministicPolicy(nn.Module):
+    """Open-loop schedule: one learned design per step, blind to history."""
+
+    def __init__(self, D: int, p: int, design_bound: float, T: int, init_scale: float = 0.5):
+        super().__init__()
+        self.D = D
+        self.p = p
+        self.design_bound = design_bound
+        self.z = nn.Parameter(init_scale * torch.randn(T, D, p))
 
     def forward(self, hist_designs, hist_outcomes):
-        base_dist = self._base_distribution(hist_designs, hist_outcomes)
-        design = torch.tanh(base_dist.rsample()) * self.design_bound  # [B, D, p]
-        return design, self._entropy(base_dist)
+        B, t = hist_designs.shape[:2]
+        design = torch.tanh(self.z[t]) * self.design_bound  # [D, p]
+        return design.unsqueeze(0).expand(B, -1, -1), None
+
+
+class StaticStochasticPolicy(TanhGaussianPolicy):
+    """Open-loop mixed strategy: one learned design distribution per step, blind to history."""
+
+    def __init__(
+        self,
+        D: int,
+        p: int,
+        design_bound: float,
+        T: int,
+        min_std: float = 0.01,
+        init_std: float = 0.5,
+        init_scale: float = 0.5,
+    ):
+        super().__init__()
+        self.D = D
+        self.p = p
+        self.design_bound = design_bound
+        self.min_std = min_std
+
+        self.mean = nn.Parameter(init_scale * torch.randn(T, D, p))
+        self.log_std = nn.Parameter(torch.full((T, D, p), math.log(max(init_std, 1e-8))))
+
+    def _base_distribution(self, hist_designs, hist_outcomes):
+        B, t = hist_designs.shape[:2]
+        mean = self.mean[t].unsqueeze(0).expand(B, -1, -1)  # [B, D, p]
+        std = (torch.exp(self.log_std[t]) + self.min_std).unsqueeze(0).expand(B, -1, -1)
+
+        return dist.Independent(dist.Normal(mean, std), reinterpreted_batch_ndims=2)
 
 
 class RandomPolicy(nn.Module):
@@ -138,5 +178,4 @@ class RandomPolicy(nn.Module):
         B = hist_designs.shape[0]
         b = self.design_bound
         design = hist_designs.new_empty(B, self.D, self.p).uniform_(-b, b)
-        entropy = hist_designs.new_full((B,), self.D * self.p * math.log(2 * b))
-        return design, entropy
+        return design, None

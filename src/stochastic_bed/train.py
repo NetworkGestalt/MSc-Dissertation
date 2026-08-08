@@ -19,9 +19,6 @@ def train(
     batch_size: int = 256,
     max_lr: float = 1e-3,
     clip_norm: float | None = 2.0,
-    alpha_init: float = 0.0,
-    alpha_final: float = 0.0,
-    alpha_frac: float = 0.9,
     adversary_step_size: float = 0.01,
     device: torch.device | None = None,
     verbose: bool = True,
@@ -55,34 +52,24 @@ def train(
 
     metrics = defaultdict(list)
 
-    alpha_steps = max(1, int(alpha_frac * num_steps))
-
     pbar = tqdm(range(num_steps), disable=not verbose)
 
     with torch.enable_grad():  # Bayesflow's torch backend disables autograd globally
         for step in pbar:
-            alpha = alpha_init + min(step / alpha_steps, 1.0) * (alpha_final - alpha_init)
-
             # Group DRO (Sagawa et al., 2020): adversary upweights high-loss groups, model minimizes weighted loss
-            group_losses, entropies = [], []
+            group_losses, stds = [], []
             for sim in simulators:
                 theta = sim.prior().sample((group_batch_size,)).to(device)
                 traj = sim.rollout(theta, policy)
 
                 group_losses.append(posterior.loss(theta, traj.designs, traj.outcomes).mean())
-                if traj.entropies is not None:
-                    entropies.append(traj.entropies.sum(dim=1).mean())
+                if traj.stds is not None:
+                    stds.append(traj.stds.mean(dim=(0, 2, 3)))  # [T]
             group_losses = torch.stack(group_losses)
 
             with torch.no_grad():
                 weights = torch.softmax(weights.log() + adversary_step_size * group_losses, dim=0)
-            weighted_loss = weights @ group_losses
-
-            if entropies:
-                entropies = torch.stack(entropies)
-                loss = weighted_loss - alpha * (weights @ entropies)
-            else:
-                loss = weighted_loss
+            loss = weights @ group_losses
 
             optimizer.zero_grad()
             loss.backward()
@@ -99,13 +86,11 @@ def train(
 
             step_metrics = {
                 "loss": loss.item(),
-                "weighted_loss": weighted_loss.item(),
-                "mean_entropy": entropies.mean().item() if len(entropies) else None,
                 "grad_norm": grad_norm.item(),
-                "alpha": alpha,
                 "learning_rate": lr,
                 "group_losses": group_losses.detach().tolist(),
                 "weights": weights.tolist(),
+                "stds": torch.stack(stds).mean(dim=0).tolist() if stds else None,
             }
             for key, value in step_metrics.items():
                 if value is not None:

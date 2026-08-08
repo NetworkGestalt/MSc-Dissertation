@@ -11,7 +11,7 @@ from torch import Tensor
 class Trajectory(NamedTuple):
     designs: Tensor  # [B, T, D, p]
     outcomes: Tensor  # [B, T, D]
-    entropies: Tensor | None  # [B, T], or None for policies without entropy
+    stds: Tensor | None  # [B, T, D, p], or None for deterministic policies
 
 
 class LocationFinding(nn.Module):
@@ -67,23 +67,23 @@ class LocationFinding(nn.Module):
     def rollout(self, theta: Tensor, policy: nn.Module) -> Trajectory:
         """Simulate full trajectories under a given batch of thetas and policy."""
         B = theta.shape[0]
-        designs, outcomes, entropies = [], [], []
+        designs, outcomes, stds = [], [], []
 
         hist_designs = theta.new_zeros(B, 0, self.D, self.p)
         hist_outcomes = theta.new_zeros(B, 0, self.D)
 
         for _ in range(self.T):
-            xi_t, entropy_t = policy(hist_designs, hist_outcomes)
+            xi_t, std_t = policy(hist_designs, hist_outcomes)
             y_t = self.step(theta, xi_t)
 
             designs.append(xi_t)
             outcomes.append(y_t)
-            entropies.append(entropy_t)
+            stds.append(std_t)
             hist_designs = torch.cat([hist_designs, xi_t.unsqueeze(1)], dim=1)
             hist_outcomes = torch.cat([hist_outcomes, y_t.unsqueeze(1)], dim=1)
 
         return Trajectory(
             designs=torch.stack(designs, dim=1),
             outcomes=torch.stack(outcomes, dim=1),
-            entropies=torch.stack(entropies, dim=1) if entropies[0] is not None else None,
+            stds=torch.stack(stds, dim=1) if stds[0] is not None else None,
         )
