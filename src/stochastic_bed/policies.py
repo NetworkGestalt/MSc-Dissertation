@@ -68,16 +68,7 @@ class DeterministicPolicy(nn.Module):
         return design, None
 
 
-class TanhGaussianPolicy(nn.Module):
-    """Base for policies whose design is a tanh-squashed Gaussian; subclasses define _base_distribution."""
-
-    def forward(self, hist_designs, hist_outcomes):
-        base_dist = self._base_distribution(hist_designs, hist_outcomes)
-        design = torch.tanh(base_dist.rsample()) * self.design_bound  # [B, D, p]
-        return design, base_dist.base_dist.stddev  # [B, D, p]
-
-
-class StochasticPolicy(TanhGaussianPolicy):
+class StochasticPolicy(nn.Module):
     def __init__(
         self,
         D: int,
@@ -120,10 +111,13 @@ class StochasticPolicy(TanhGaussianPolicy):
             reinterpreted_batch_ndims=2,
         )  # Event shape: [D, p]
 
+    def forward(self, hist_designs, hist_outcomes):
+        base_dist = self._base_distribution(hist_designs, hist_outcomes)
+        design = torch.tanh(base_dist.rsample()) * self.design_bound  # [B, D, p]
+        return design, base_dist.base_dist.stddev  # [B, D, p]
+
 
 class StaticDeterministicPolicy(nn.Module):
-    """Open-loop schedule: one learned design per step, blind to history."""
-
     def __init__(self, D: int, p: int, design_bound: float, T: int, init_scale: float = 0.5):
         super().__init__()
         self.D = D
@@ -137,9 +131,7 @@ class StaticDeterministicPolicy(nn.Module):
         return design.unsqueeze(0).expand(B, -1, -1), None
 
 
-class StaticStochasticPolicy(TanhGaussianPolicy):
-    """Open-loop mixed strategy: one learned design distribution per step, blind to history."""
-
+class StaticStochasticPolicy(nn.Module):
     def __init__(
         self,
         D: int,
@@ -165,6 +157,11 @@ class StaticStochasticPolicy(TanhGaussianPolicy):
         std = (torch.exp(self.log_std[t]) + self.min_std).unsqueeze(0).expand(B, -1, -1)
 
         return dist.Independent(dist.Normal(mean, std), reinterpreted_batch_ndims=2)
+
+    def forward(self, hist_designs, hist_outcomes):
+        base_dist = self._base_distribution(hist_designs, hist_outcomes)
+        design = torch.tanh(base_dist.rsample()) * self.design_bound  # [B, D, p]
+        return design, base_dist.base_dist.stddev  # [B, D, p]
 
 
 class RandomPolicy(nn.Module):
